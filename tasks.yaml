@@ -1,0 +1,145 @@
+includes:
+  - setup: https://raw.githubusercontent.com/defenseunicorns/uds-common/v1.4.0/tasks/setup.yaml
+
+
+tasks:
+  - name: dev
+    actions:
+      - cmd: rm -rf jwks certs data
+      - cmd: mkdir certs && mkdir data
+      - task: setup:k3d-test-cluster
+      - task: setup:create-doug-user
+      - task: setup:print-keycloak-admin-password
+      - task: kc-docker-feature
+      - task: create-docker-client
+      - task: get-docker-pem
+      - task: restart-docker
+      - task: smoke-test
+
+  - name: kc-docker-feature
+    actions:
+      - cmd: |
+          kubectl get statefulset keycloak -n keycloak -o json | \
+          jq '.spec.template.spec.containers[0].args |= map(
+                if test("--features=preview") then sub("--features=preview"; "--features=preview,docker") else . end
+              )' | \
+          kubectl replace -f -
+          kubectl rollout status statefulset/keycloak -n keycloak
+
+  - name: restart-docker
+    description: Restart docker
+    actions:
+      - cmd: docker stop docker-registry || exit 0
+      - description: Restart docker
+        cmd: docker compose down && docker compose up --detach
+
+  - name: smoke-test
+    description: smoke test
+    actions:
+      - description: pull, tag, and push alpine
+        cmd: |
+          echo "unicorn123!@#UN" | docker login localhost:5001 -u doug --password-stdin
+          docker pull alpine:3.6
+          docker tag alpine:3.6 localhost:5001/alpine:3.6
+          docker push localhost:5001/alpine:3.6
+
+
+  - name: create-docker-client
+    description: Creates a docker registry client in the uds realm
+    actions:
+      - description: Creating the 'docker-registry' client
+        cmd: |
+          KEYCLOAK_ADMIN_PASSWORD=$(./uds zarf tools kubectl get secret -n keycloak keycloak-admin-password -o jsonpath='{.data.password}' | base64 -d)
+          KEYCLOAK_ADMIN_TOKEN=$(curl -s --location "https://keycloak.admin.uds.dev/realms/master/protocol/openid-connect/token" \
+            --header "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "username=admin" \
+            --data-urlencode "password=${KEYCLOAK_ADMIN_PASSWORD}" \
+            --data-urlencode "client_id=admin-cli" \
+            --data-urlencode "grant_type=password" | ./uds zarf tools yq .access_token)
+
+          echo "$KEYCLOAK_ADMIN_PASSWORD"
+          echo "$KEYCLOAK_ADMIN_TOKEN"
+
+          curl -X POST "https://keycloak.admin.uds.dev/admin/realms/uds/clients" \
+              -H "Authorization: Bearer $KEYCLOAK_ADMIN_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{
+                    "clientId": "docker-registry",
+                    "protocol": "docker-v2",
+                    "publicClient": false,
+                    "directAccessGrantsEnabled": true,
+                    "enabled": true
+                  }'
+
+  - name: get-docker-pem
+    description: gets the docker pem
+    actions:
+      - description: gets the docker pem
+        cmd: |
+          # Configuration
+          KEYCLOAK_CERTS_URL="https://sso.uds.dev/realms/uds/protocol/openid-connect/certs"
+          OUTPUT_CERT_FILE="certs/keycloak.pem"
+          DEFAULT_ALG="RS256"
+
+          rm -f $OUTPUT_CERT_FILE
+
+          # Fetch the public keys
+          response=$(curl -s "$KEYCLOAK_CERTS_URL")
+
+          if [[ -z "$response" ]]; then
+              echo "Failed to fetch public keys from Keycloak."
+              exit 1
+          fi
+
+          # Extract the first key with algorithm RS256
+          cert=$(echo "$response" | jq -r --arg alg "$DEFAULT_ALG" '
+              .keys[] | select(.alg == $alg and .use == "sig") | .x5c[0] // empty' | head -n 1)
+
+          if [[ -z "$cert" ]]; then
+              echo "No active RS256 signing certificate found."
+              exit 1
+          fi
+
+          # Save the certificate to a PEM file
+          {
+              echo "-----BEGIN CERTIFICATE-----"
+              echo "$cert"
+              echo "-----END CERTIFICATE-----"
+          } > "$OUTPUT_CERT_FILE"
+
+          echo "Certificate saved to $OUTPUT_CERT_FILE."
+
+
+  # left this in for reference, not using it now. (I'm now using the PEM way above which is good for registry v2)
+  # registry v3 seems to need the jwks and it has the formatting issue, hence the hack below that modifies the kid in the jwks file
+  - name: jwks
+    description: Get a jwks that docker can tolerate
+    actions:
+      - description: Get a jwks that docker can tolerate
+        cmd: |
+          (curl -L -s https://sso.uds.dev/realms/uds/protocol/openid-connect/certs | jq -r .) > jwks/jwks_original.json
+
+          # the rest of this is a total hack because i haven't figured out yet why the keycloak key id 
+          # doesn't match between the certs endpoint and what comes out in the tokens
+          # so i'm generating a token to get the correct id to get these to match so docker can be happy
+
+          USERNAME="doug"
+          PASSWORD="unicorn123!@#UN"
+          SERVICE="docker-registry"  # The service you are authenticating against
+          SCOPE="repository:my-repo:pull"  # Example scope for the Docker registry
+
+          RESPONSE=$(curl -s -G "https://sso.uds.dev/realms/uds/protocol/docker-v2/auth" \
+              --data-urlencode "service=$SERVICE" \
+              --data-urlencode "scope=$SCOPE" \
+              --user "$USERNAME:$PASSWORD")
+
+          ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.token')
+          KC_DOCKER_KID=$(echo "$ACCESS_TOKEN" | awk -F '.' '{print $1}' | base64 -d | jq -r .kid)
+
+          jq --arg new_kid "$KC_DOCKER_KID" '
+          .keys |= map(
+            if .kty == "RSA" and .alg == "RS256" then
+              .kid = $new_kid
+            else .
+            end
+          )' jwks/jwks_original.json > jwks/jwks_docker.json

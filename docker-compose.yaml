@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  registry:
+    image: registry:2.8.3
+    container_name: docker-registry
+    ports:
+      - "5001:5000"
+    environment:
+      REGISTRY_AUTH: token
+      REGISTRY_AUTH_TOKEN_REALM: https://sso.uds.dev/realms/uds/protocol/docker-v2/auth
+      REGISTRY_AUTH_TOKEN_SERVICE: docker-registry
+      REGISTRY_AUTH_TOKEN_ISSUER: https://sso.uds.dev/realms/uds
+      REGISTRY_AUTH_TOKEN_ROOTCERTBUNDLE: /etc/certs/keycloak.pem
+      OTEL_TRACES_EXPORTER: none
+    volumes:
+      - ./data:/var/lib/registry
+      - ./certs:/etc/certs
+    restart: unless-stopped
